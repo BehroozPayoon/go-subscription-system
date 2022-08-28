@@ -1,6 +1,12 @@
 package main
 
-import "net/http"
+import (
+	"fmt"
+	"html/template"
+	"net/http"
+	"strconv"
+	"subscription-system/data"
+)
 
 func (app *Config) HomePage(w http.ResponseWriter, req *http.Request) {
 	app.render(w, req, "home.page.gohtml", nil)
@@ -66,9 +72,125 @@ func (app *Config) RegisterPage(w http.ResponseWriter, req *http.Request) {
 }
 
 func (app *Config) PostRegisterPage(w http.ResponseWriter, req *http.Request) {
+	err := req.ParseForm()
+	if err != nil {
+		app.ErrorLog.Println(err)
+	}
+	u := data.User{
+		Email:     req.Form.Get("email"),
+		FirstName: req.Form.Get("first_name"),
+		LastName:  req.Form.Get("last_name"),
+		Password:  req.Form.Get("Password"),
+		Active:    0,
+		IsAdmin:   0,
+	}
 
+	_, err = u.Insert(u)
+	if err != nil {
+		app.Session.Put(req.Context(), "error", "unable to create user")
+		http.Redirect(w, req, "/register", http.StatusSeeOther)
+		return
+	}
+
+	url := fmt.Sprintf("https://payoon.dev/activate?email=%s", u.Email)
+	signedURL := GenerateTokenFromString(url)
+
+	msg := Message{
+		To:       u.Email,
+		Subject:  "Activate your account",
+		Template: "confirmation-email",
+		Data:     template.HTML(signedURL),
+	}
+	app.sendEmail(msg)
+
+	app.Session.Put(req.Context(), "flash", "Confirmation email sent. Check your email")
+	http.Redirect(w, req, "/login", http.StatusSeeOther)
 }
 
 func (app *Config) Activate(w http.ResponseWriter, req *http.Request) {
+	url := req.RequestURI
+	testURL := fmt.Sprintf("https://payoon%s", url)
+	okay := VerifyToken(testURL)
 
+	if !okay {
+		app.Session.Put(req.Context(), "error", "Invalid Token")
+		http.Redirect(w, req, "/", http.StatusSeeOther)
+		return
+	}
+
+	u, err := app.Models.User.GetByEmail(req.URL.Query().Get("email"))
+	if err != nil {
+		app.Session.Put(req.Context(), "error", "No user found")
+		http.Redirect(w, req, "/", http.StatusSeeOther)
+		return
+	}
+
+	u.Active = 1
+	err = u.Update()
+	if err != nil {
+		app.Session.Put(req.Context(), "error", "Unable to update user")
+		http.Redirect(w, req, "/", http.StatusSeeOther)
+		return
+	}
+
+	app.Session.Put(req.Context(), "flash", "Account activate")
+	http.Redirect(w, req, "/login", http.StatusSeeOther)
+}
+
+func (app *Config) ChooseSubscription(w http.ResponseWriter, req *http.Request) {
+	plans, err := app.Models.Plan.GetAll()
+	if err != nil {
+		app.ErrorLog.Println(err)
+		return
+	}
+
+	dataMap := make(map[string]any)
+	dataMap["plans"] = plans
+
+	app.render(w, req, "plans.page.gohtml", &TemplateData{
+		Data: dataMap,
+	})
+}
+
+func (app *Config) SubscribeToPlan(w http.ResponseWriter, req *http.Request) {
+	id := req.URL.Query().Get("id")
+
+	planId, _ := strconv.Atoi(id)
+
+	plan, err := app.Models.Plan.GetOne(planId)
+	if err != nil {
+		app.Session.Put(req.Context(), "error", "Unable to find plan")
+		http.Redirect(w, req, "/members/plans", http.StatusSeeOther)
+		return
+	}
+
+	user, ok := app.Session.Get(req.Context(), "user").(data.User)
+	if !ok {
+		app.Session.Put(req.Context(), "error", "login first")
+		http.Redirect(w, req, "/login", http.StatusSeeOther)
+		return
+	}
+
+	app.Wait.Add(1)
+
+	func() {
+		defer app.Wait.Done()
+
+		invoice, err := app.getInvoice(user, plan)
+		if err != nil {
+			app.ErrorChan <- err
+		}
+
+		msg := Message{
+			To:       user.Email,
+			Subject:  "Your Invoice",
+			Data:     invoice,
+			Template: "invoice",
+		}
+		app.sendEmail(msg)
+	}()
+}
+
+func (app *Config) getInvoice(user data.User, plan *data.Plan) (string, error) {
+	return plan.PlanAmountFormatted, nil
 }
